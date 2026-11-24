@@ -74,14 +74,147 @@ function nextAlertAfter(time) {
     }
   }
 }
+// Phones with a locked screen and background tabs are put to sleep by the browser:
+// an alert that went off while asleep is still shown when the page wakes up (up to 2 min late).
+const ALERT_GRACE = 2 * 60000;
+const pageOpenedAt = Date.now();
 let alertNext = nextAlertAfter(Date.now());
-setInterval(() => {
+let lastAlertDue = 0;
+function checkAlert() {
   const t = Date.now();
   if (t < alertNext) return;
-  const due = alertNext;
-  alertNext = nextAlertAfter(t);
-  if (screen === 'waiting' && t < due + 10000) showAlert();
-}, 200);
+  let due = alertNext;
+  while ((alertNext = nextAlertAfter(due)) <= t) due = alertNext;   // most recent alert time that has passed
+  if (due === lastAlertDue || t > due + ALERT_GRACE || due < pageOpenedAt) return;
+  lastAlertDue = due;
+  if (screen === 'waiting') showAlert();
+}
+setInterval(checkAlert, 200);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAlert(); });
+
+// ---------- shared waiting room: "Duel now" rings on every screen ----------
+// The first open page claims the PeerJS id "english-duel-v1-lobby" and becomes the hub;
+// the other pages connect to it. When the hub page closes, the others elect a new hub.
+// pages opened on localhost get their own waiting room, so local tests never ring the real site
+const LOBBY_ID = PEER_PREFIX + (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? 'lobby-dev' : 'lobby');
+const lobby = { peer: null, isHub: false, conns: new Set(), hubConn: null, count: 0, retry: null, awaiting: 0, pendingDuel: null };
+// Heartbeat: every 3 s each screen asks the hub "are you there?" and the hub answers right away
+// (answers are event-driven, so they work even if the hub's tab is in the background).
+// No answer within 10 s → the hub is gone → elect a new one.
+const LOBBY_BEAT = 3000, LOBBY_HUB_TIMEOUT = 10000, LOBBY_CLIENT_TIMEOUT = 120000;
+
+function lobbyStart() {
+  if (typeof Peer === 'undefined') return;
+  lobbyStop();
+  const peer = new Peer(LOBBY_ID);   // try to become the hub
+  lobby.peer = peer;
+  peer.on('open', () => { if (lobby.peer !== peer) return; lobby.isHub = true; lobbyCountChanged(); });
+  peer.on('connection', (conn) => {
+    conn.seen = Date.now();
+    conn.on('open', () => { lobby.conns.add(conn); lobbyCountChanged(); });
+    conn.on('data', (msg) => {
+      conn.seen = Date.now();
+      if (msg && msg.t === 'duel') lobbyDuel();
+      else if (msg && msg.t === 'beat') { try { conn.send({ t: 'count', n: lobby.count }); } catch {} }
+      else if (msg && msg.t === 'bye') { lobby.conns.delete(conn); lobbyCountChanged(); }
+    });
+    conn.on('close', () => { lobby.conns.delete(conn); lobbyCountChanged(); });
+  });
+  peer.on('error', (e) => {
+    if (lobby.peer !== peer) return;
+    if (e.type === 'unavailable-id' && !lobby.isHub) { peer.destroy(); lobbyJoin(); }   // someone else is the hub
+    else if (!lobby.isHub) lobbyRetry();
+  });
+  peer.on('disconnected', () => { if (lobby.peer === peer && !peer.destroyed) setTimeout(() => !peer.destroyed && peer.reconnect(), 1000); });
+}
+function lobbyJoin() {
+  const peer = new Peer();
+  lobby.peer = peer; lobby.isHub = false;
+  peer.on('open', () => {
+    if (lobby.peer !== peer) return;
+    const conn = peer.connect(LOBBY_ID, { reliable: true });
+    lobby.hubConn = conn;
+    conn.on('open', () => { lobby.awaiting = 0; });
+    setTimeout(() => { if (lobby.peer === peer && !conn.open) lobbyRetry(); }, 8000);   // never connected: try again
+    conn.on('data', (msg) => {
+      if (!msg || lobby.peer !== peer) return;
+      lobby.awaiting = 0;   // the hub is alive
+      if (msg.t === 'duel') onLobbyDuel();
+      else if (msg.t === 'count') { lobby.count = msg.n; showLobbyCount(); }
+      else if (msg.t === 'bye') lobbyRetry();   // the hub page is closing: elect a new one
+    });
+    conn.on('close', () => { if (lobby.peer === peer) lobbyRetry(); });   // the hub left: elect a new one
+  });
+  peer.on('error', () => { if (lobby.peer === peer) lobbyRetry(); });
+}
+function lobbyRetry() {
+  if (lobby.retry) return;
+  lobby.count = 0; showLobbyCount();
+  // random delay so that the remaining pages don't all try to become the hub at the same instant
+  lobby.retry = setTimeout(() => { lobby.retry = null; lobbyStart(); }, 800 + Math.random() * 2000);
+}
+function lobbyStop() {
+  const peer = lobby.peer;
+  lobby.peer = null; lobby.isHub = false; lobby.hubConn = null; lobby.conns.clear();
+  if (peer) try { peer.destroy(); } catch {}
+}
+function lobbyCountChanged() {
+  lobby.count = lobby.conns.size + 1;
+  for (const c of lobby.conns) try { c.send({ t: 'count', n: lobby.count }); } catch {}
+  showLobbyCount();
+}
+function lobbyDuel() {   // hub: ring everyone, including itself
+  for (const c of lobby.conns) try { c.send({ t: 'duel' }); } catch {}
+  onLobbyDuel();
+}
+function onLobbyDuel() {
+  clearTimeout(lobby.pendingDuel); lobby.pendingDuel = null;
+  if (screen === 'waiting') showAlert();
+}
+function duelNowForEveryone() {
+  if (lobby.isHub) return lobbyDuel();
+  const ringHereOnly = () => {
+    lobby.pendingDuel = null;
+    showAlert(); toast('Not connected to the other screens: the alert only shows here');
+    lobbyRetry();
+  };
+  if (!(lobby.hubConn && lobby.hubConn.open)) return ringHereOnly();
+  lobby.hubConn.send({ t: 'duel' });
+  // the hub sends the alert back to us too; if it doesn't within 1.5 s, the hub is gone
+  clearTimeout(lobby.pendingDuel);
+  lobby.pendingDuel = setTimeout(ringHereOnly, 1500);
+}
+setInterval(() => {
+  const t = Date.now();
+  if (lobby.isHub) {
+    // forget screens that stopped talking (closed without saying bye)
+    let removed = false;
+    for (const c of lobby.conns) if (t - c.seen > LOBBY_CLIENT_TIMEOUT) { lobby.conns.delete(c); removed = true; try { c.close(); } catch {} }
+    if (removed) lobbyCountChanged();
+  } else if (lobby.hubConn && lobby.hubConn.open) {
+    if (lobby.awaiting && t - lobby.awaiting > LOBBY_HUB_TIMEOUT) lobbyRetry();   // no answer: the hub is gone
+    else if (!lobby.awaiting) { lobby.awaiting = t; try { lobby.hubConn.send({ t: 'beat' }); } catch {} }
+  }
+}, LOBBY_BEAT);
+// closing or leaving the page: tell the others right away
+window.addEventListener('pagehide', () => {
+  try {
+    if (lobby.isHub) for (const c of lobby.conns) c.send({ t: 'bye' });
+    else if (lobby.hubConn && lobby.hubConn.open) lobby.hubConn.send({ t: 'bye' });
+  } catch {}
+});
+function showLobbyCount() {
+  const el = document.getElementById('lobbyCount');
+  if (!el) return;
+  el.textContent = lobby.count > 1 ? `📡 ${lobby.count} screens connected` : lobby.count === 1 ? '📡 Only this screen is connected' : '📡 Connecting to the other screens…';
+}
+// when the phone wakes up, make sure we're still in the waiting room
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || lobby.isHub || lobby.retry) return;
+  if (!(lobby.hubConn && lobby.hubConn.open)) return lobbyRetry();
+  lobby.awaiting = Date.now();   // just woke up: check right away that the hub is still there
+  try { lobby.hubConn.send({ t: 'beat' }); } catch {}
+});
 
 function showAlert() {
   go('alert'); sfx.siren();
@@ -257,7 +390,8 @@ const screens = {
       <div class="dice">🎲</div>
       <h1>Game in progress…</h1>
       <p class="muted">A duel can break out at any moment. Keep playing!</p>
-      <button class="btn small ghost mt" id="duelNow" title="Shows the duel alert on this screen only">⚔️ Duel now</button>
+      <button class="btn small ghost mt" id="duelNow" title="Rings the duel alert on every connected screen">⚔️ Duel now</button>
+      <p class="muted small" id="lobbyCount"></p>
     </div>`,
 
   alert: () => `
@@ -418,7 +552,8 @@ function render() {
   tickTimer();
 
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
-  on('duelNow', showAlert);
+  on('duelNow', duelNowForEveryone);
+  showLobbyCount();
   on('accept', () => go('role'));
   on('backWait', () => go('waiting'));
   on('asRef', () => go('create'));
@@ -496,6 +631,7 @@ function tickTimer() {
 
 // ---------- boot ----------
 (async function boot() {
+  lobbyStart();
   const roomParam = (new URLSearchParams(location.search).get('room') || '').toUpperCase();
   let saved = null;
   try { saved = JSON.parse(store.get(HOST_SAVE_KEY)); } catch {}
