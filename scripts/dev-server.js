@@ -1,4 +1,4 @@
-// English Duel — local server (npm start).
+// English Duel — local dev server (npm start). Not used on Vercel.
 // Serves /public and the same /api functions that Vercel runs.
 // Without Redis credentials, game state is kept in memory (fine for local play).
 const http = require('http');
@@ -6,8 +6,9 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const PUBLIC = path.join(__dirname, 'public');
-const API = path.join(__dirname, 'api');
+const ROOT = path.join(__dirname, '..');
+const PUBLIC = path.join(ROOT, 'public');
+const API = path.join(ROOT, 'api');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 
 // /api/<name> -> api/<name>.js
