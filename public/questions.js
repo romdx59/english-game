@@ -1,6 +1,6 @@
 // Question bank (multiple choice).
 // c = category, q = question, a = the correct answer, w = three wrong answers.
-// The four choices are shuffled for each player. Loaded in the browser (the referee's page runs the game).
+// The four choices are shuffled for each player.
 window.QUESTIONS = [
   // ---- Translate (FR -> EN) ----
   { c: 'Translate', q: 'Translate: "une fourchette"', a: 'a fork', w: ['a spoon', 'a knife', 'a plate'] },

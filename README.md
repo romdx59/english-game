@@ -1,39 +1,23 @@
 # ⚔️ English Duel
 
-A real-time English quiz duel for 3 people: one referee and two players, each on their own screen. There is no database and no backend: the referee's browser runs the game, and the players connect to it directly.
+A quick English quiz duel between two players on **one screen**. It has no server, no database and no network connection: everything runs in the page, so it also works on 4G or offline once loaded.
 
 ## How it works
 
-1. Everyone opens the site and sees **"Game in progress…"**.
-2. At a random moment (every 1–10 min) a **"DUEL!"** alert shows up on every screen at the same time.
-3. Each person picks a role:
-   - **Referee**: creates the room (duel length, question categories) and gets a 4-letter code. Their page runs the game, so it must stay open.
-   - **Player**: enters the room code and their name.
-4. When both players are in, the referee starts the duel. After a 3-2-1 countdown, the shared timer starts.
-5. Each player answers their own multiple-choice questions (4 choices). A correct answer is worth 1 point and a wrong one is worth 0. Either way, the next question comes right after.
-6. When the timer ends, the referee sees both scores and the winner. Each player sees only their own score.
+1. Open the site and leave it on **"Game in progress…"** while you play something else.
+2. At a random moment (every 1–10 min) the screen flashes **"DUEL!"** with a siren. The person who was playing picks an opponent.
+   - **Duel now** shows the alert right away.
+   - If the device was asleep at that moment (locked screen, background tab), the alert shows as soon as it wakes up.
+3. The referee types both names, the duel length and the question categories, then starts the duel.
+4. After a 3-2-1 countdown, the shared timer starts. The screen is split in two: each player has their own multiple-choice questions (4 choices) and their own score.
+   - A correct answer is worth 1 point and a wrong one is worth 0. Either way, the next question comes right after.
+   - **On a computer**: player 1 (left) answers with keys **A Z E R**, player 2 (right) with **U I O P**. These are the physical key positions, so on a QWERTY keyboard player 1 uses Q W E R.
+   - **On a tablet or phone held upright**: players sit face to face. The top half is upside down for the player across the table, and each player taps their own half.
+5. When the timer ends, the screen shows both scores and the winner. Draws are possible. Then choose **Rematch** or **Back to the game**.
 
-## How it works without a server
+The last duels are listed on the waiting screen. They are saved in this browser only.
 
-- **Connections**: they are peer-to-peer (WebRTC) through [PeerJS](https://peerjs.com).
-  - The referee's page registers as `english-duel-v1-<CODE>` on the free PeerJS service.
-  - Players use it only to find the referee, then talk to them directly.
-  - If a direct connection is impossible (strict networks), PeerJS falls back to its relay servers.
-- **The game itself** ([`public/host.js`](public/host.js)) runs in the referee's browser:
-  - it keeps the questions, scores and timer;
-  - it checks every answer.
-- **Reloads**:
-  - If a player reloads, they get their seat back.
-  - If the referee reloads, the room is reopened and the players reconnect automatically.
-  - If the referee closes the tab, the room ends.
-- **The random "DUEL!" alert**: every page computes the same pseudo-random alert times from the date, so all screens go off together without talking to each other. Devices keep their clocks in sync over the internet.
-  - A screen that was asleep (locked phone, background tab) still shows an alert it missed when it wakes up, up to 2 min late.
-  - To test it, add `?alert=0.2-0.5` (minutes) to the URL on every screen.
-- **The "Duel now" button and the screen counter** use a shared waiting room:
-  - The first open page claims the PeerJS id `english-duel-v1-lobby` and becomes the hub; the other pages connect to it.
-  - "Duel now" on any screen goes through the hub, which rings every connected screen.
-  - Every 3 s, each screen checks that the hub still answers. If the hub page is closed, the remaining screens elect a new hub within about 15 s.
-  - Pages opened on `localhost` use a separate waiting room (`…-lobby-dev`), so local tests never ring the real site.
+To test the alert quickly, open the site with `?alert=0.1-0.2` (minutes) at the end of the URL.
 
 ## Deploy on Vercel
 
@@ -41,15 +25,13 @@ The site is plain static files in `public/`, and `vercel.json` already sets that
 1. Import the GitHub repo in Vercel.
 2. Keep the defaults and deploy.
 
-No environment variables or storage are needed.
-
 ## Run it locally
 
 ```bash
 npm start
 ```
 
-Then open http://localhost:3000. It needs an internet connection for PeerJS. You can also play on several tabs of the same browser.
+Then open http://localhost:3000. You can also just open `public/index.html` in a browser.
 
 ## Questions
 

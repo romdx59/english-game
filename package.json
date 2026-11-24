@@ -2,7 +2,7 @@
   "name": "english-duel",
   "version": "1.0.0",
   "private": true,
-  "description": "Real-time English quiz duel, peer-to-peer: a referee and two players, a random DUEL! alert, shared timer, multiple-choice questions. No backend.",
+  "description": "English quiz duel for two players on one screen: random DUEL! alert, shared timer, multiple-choice questions. No server.",
   "scripts": {
     "start": "node scripts/dev-server.js"
   },
