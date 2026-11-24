@@ -73,7 +73,7 @@ async function pollOnce() {
       const { r, j } = await getJson(`/api/state?code=${encodeURIComponent(code)}&token=${encodeURIComponent(token)}${ping ? '&ping=1' : ''}`);
       if (code !== pollCode) return;               // left the room meanwhile
       if (r.ok) { if (ping) lastPing = Date.now(); onRoomState(j); }
-      else if (r.status === 403 || r.status === 404) { toast(j.error || 'Room closed'); leaveRoom(); }
+      else if ([403, 404, 410].includes(r.status)) roomGone(j.error || 'The room was closed');
     } else {
       const { r, j } = await getJson('/api/alert');
       const err = r.ok ? '' : (j.error || 'Server unavailable');
@@ -115,11 +115,26 @@ function onRoomState(s) {
   if (screen === 'room' && sameState(prev, s)) return;   // nothing new: don't rebuild the page
   screen = 'room'; render();
 }
+// Leaving on purpose: tell the server (referee → closes the room for everyone, player → frees the seat)
 function leaveRoom() {
+  if (state) post('/api/leave', { code: state.code }).catch(() => {});
+  backToWaiting();
+}
+function backToWaiting() {
   state = null; feedback = null;
   history.replaceState(null, '', location.pathname);
   startPolling(null);
   go('waiting');
+}
+// The room disappeared (referee closed it, or we were kicked)
+function roomGone(msg) {
+  if (state && state.status === 'over' && state.role !== 'ref') {
+    // keep showing the final score; the player goes back with the button when ready
+    startPolling(null);
+    return;
+  }
+  toast(msg);
+  backToWaiting();
 }
 
 function go(s) { screen = s; render(); }
@@ -250,6 +265,7 @@ function playerView() {
         <p>${s.opponent ? `Your opponent: <b>${esc(s.opponent)}</b>` : 'Waiting for your opponent…'}</p>
         <div class="spinner"></div>
         <p class="muted">Waiting for the referee to start the duel…</p>
+        <button class="btn ghost mt" id="leave">Leave the room</button>
       </div>`;
   }
   if (s.status === 'over') {
@@ -411,5 +427,5 @@ setInterval(() => {
 const roomParam = new URLSearchParams(location.search).get('room');
 if (roomParam) {
   // reload while in a room → reconnect if we were part of it
-  post('/api/join', { code: roomParam, check: true }).then(r => enterRoom(r.code)).catch(() => leaveRoom());
+  post('/api/join', { code: roomParam, check: true }).then(r => enterRoom(r.code)).catch(() => backToWaiting());
 } else { startPolling(null); render(); }
