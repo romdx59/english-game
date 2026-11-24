@@ -24,7 +24,9 @@ async function post(url, body) {
   if (!r.ok) throw new Error(j.error || 'Error');
   return j;
 }
-const act = (action, extra = {}) => post('/api/action', { code: state.code, action, ...extra }).catch(e => toast(e.message));
+const act = (action, extra = {}) => post('/api/action', { code: state.code, action, ...extra })
+  .then(j => { if (j.state) onRoomState(j.state); })
+  .catch(e => toast(e.message));
 const now = () => Date.now() + offset;
 
 // ---------- sound (browsers only allow it after a first click on the page) ----------
@@ -49,19 +51,48 @@ const sfx = {
   end: () => { tone(523, .2, 'triangle', .2); tone(659, .2, 'triangle', .2, .2); tone(784, .5, 'triangle', .2, .4); },
 };
 
-// ---------- one live stream per page: global "DUEL!" alert + room state ----------
-let stream = null;
-function connect(code) {
-  if (stream) stream.close();
-  const qs = `token=${encodeURIComponent(token)}` + (code ? `&code=${encodeURIComponent(code)}` : '');
-  stream = new EventSource(`/api/stream?${qs}`);
-  stream.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'duel' && screen === 'waiting') showAlert();
-    else if (msg.type === 'room') onRoomState(msg.state);
-    else if (msg.type === 'noroom') { toast('Room not found'); leaveRoom(); }
-  };
+// ---------- polling (works on serverless hosting like Vercel) ----------
+// Outside a room: ask every 4 s when the next global "DUEL!" alert is due, then fire it at that exact time.
+// Inside a room: fetch the room state every 0.7 s during a duel, 1.5 s otherwise.
+let alertNext = 0, lastFired = 0, dbError = '';
+let pollCode = null, pollTimer = null, lastPing = 0;
+
+async function getJson(url) {
+  const t0 = Date.now();
+  const r = await fetch(url, { cache: 'no-store' });
+  const j = await r.json().catch(() => ({}));
+  if (j.serverNow) offset = j.serverNow - (t0 + Date.now()) / 2;   // keep clocks in sync
+  return { r, j };
 }
+
+async function pollOnce() {
+  const code = pollCode;
+  try {
+    if (code) {
+      const ping = Date.now() - lastPing > 3000;
+      const { r, j } = await getJson(`/api/state?code=${encodeURIComponent(code)}&token=${encodeURIComponent(token)}${ping ? '&ping=1' : ''}`);
+      if (code !== pollCode) return;               // left the room meanwhile
+      if (r.ok) { if (ping) lastPing = Date.now(); onRoomState(j); }
+      else if (r.status === 403 || r.status === 404) { toast(j.error || 'Room closed'); leaveRoom(); }
+    } else {
+      const { r, j } = await getJson('/api/alert');
+      const err = r.ok ? '' : (j.error || 'Server unavailable');
+      if (r.ok) alertNext = j.next;
+      if (err !== dbError) { dbError = err; if (screen === 'waiting') render(); }
+    }
+  } catch { /* network hiccup: try again next time */ }
+}
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  const delay = pollCode ? (state?.status === 'running' ? 700 : 1500) : 4000;
+  pollTimer = setTimeout(() => pollOnce().then(schedulePoll), delay);
+}
+function startPolling(code) {
+  pollCode = code; lastPing = 0;
+  clearTimeout(pollTimer);
+  pollOnce().then(schedulePoll);
+}
+
 function showAlert() {
   go('alert'); sfx.siren();
   let on = false; clearInterval(showAlert.flash);
@@ -74,19 +105,20 @@ function showAlert() {
 // ---------- room connection ----------
 function enterRoom(code) {
   history.replaceState(null, '', `?room=${code}`);
-  connect(code);
+  startPolling(code);
 }
+const sameState = (a, b) => a && b && JSON.stringify({ ...a, serverNow: 0 }) === JSON.stringify({ ...b, serverNow: 0 });
 function onRoomState(s) {
   const prev = state;
   state = s;
-  offset = state.serverNow - Date.now();
   if (prev && prev.status === 'running' && state.status === 'over') sfx.end();
+  if (screen === 'room' && sameState(prev, s)) return;   // nothing new: don't rebuild the page
   screen = 'room'; render();
 }
 function leaveRoom() {
   state = null; feedback = null;
   history.replaceState(null, '', location.pathname);
-  connect(null);
+  startPolling(null);
   go('waiting');
 }
 
@@ -111,7 +143,8 @@ const screens = {
       <div class="dice">🎲</div>
       <h1>Game in progress…</h1>
       <p class="muted">A duel can break out at any moment. Keep playing!</p>
-      <button class="btn small ghost mt" id="duelNow" title="Trigger the alert on every screen now">⚔️ Duel now</button>
+      ${dbError ? `<p class="error">⚠️ ${esc(dbError)}</p>` : ''}
+      <button class="btn small ghost mt" id="duelNow" title="Trigger the alert on every screen in a few seconds">⚔️ Duel now</button>
     </div>`,
 
   alert: () => `
@@ -260,6 +293,7 @@ async function answer(i) {
     const r = await post('/api/answer', { code: state.code, id: q.id, choice: i });
     feedback = { q, choice: i, correct: r.correct, ok: r.ok };
     r.ok ? sfx.good() : sfx.bad();
+    state = r.state;   // contains the next question and the new score
     render();
     setTimeout(() => { feedback = null; render(); }, r.ok ? 450 : 900);
   } catch (e) { if (e.message !== 'Not running') toast(e.message); }
@@ -276,7 +310,9 @@ function render() {
   tickTimer();
 
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
-  on('duelNow', () => post('/api/duel-now', {}).catch(e => toast(e.message)));
+  on('duelNow', () => post('/api/duel-now', {})
+    .then(j => { alertNext = j.next; toast('⚔️ Duel in a few seconds on every screen…'); })
+    .catch(e => toast(e.message)));
   on('accept', () => go('role'));
   on('backWait', () => go('waiting'));
   on('asRef', () => go('create'));
@@ -291,8 +327,7 @@ function render() {
       const categories = [...app.querySelectorAll('[data-cat]:checked')].map(c => c.dataset.cat);
       if (!categories.length) return toast('Pick at least one category');
       try {
-        const { code } = await post('/api/create', {});
-        await post('/api/action', { code, action: 'settings', seconds, categories });
+        const { code } = await post('/api/create', { seconds, categories });
         enterRoom(code);
       } catch (e) { toast(e.message); }
     });
@@ -359,13 +394,22 @@ function tickTimer() {
     el.classList.toggle('crit', left < 10000);
     const sec = Math.ceil(left / 1000);
     if (left > 0 && left <= 5000 && sec !== lastSec) { lastSec = sec; sfx.tick(); }
+    if (left === 0 && !tickTimer.ended) { tickTimer.ended = true; setTimeout(() => pollOnce(), 150); }  // fetch the results right away
+    if (left > 0) tickTimer.ended = false;
   }
 }
 (function loop() { tickTimer(); requestAnimationFrame(loop); })();
+
+// fire the global alert at the exact time the server announced (setInterval keeps running in background tabs)
+setInterval(() => {
+  if (screen !== 'waiting' || !alertNext || alertNext === lastFired) return;
+  const t = now();
+  if (t >= alertNext && t < alertNext + 10000) { lastFired = alertNext; showAlert(); }
+}, 200);
 
 // ---------- boot ----------
 const roomParam = new URLSearchParams(location.search).get('room');
 if (roomParam) {
   // reload while in a room → reconnect if we were part of it
   post('/api/join', { code: roomParam, check: true }).then(r => enterRoom(r.code)).catch(() => leaveRoom());
-} else { connect(null); render(); }
+} else { startPolling(null); render(); }
