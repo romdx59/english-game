@@ -1,33 +1,35 @@
-// English Duel — client
+// English Duel — client (UI + peer-to-peer connection)
+// The referee's page runs the game (host.js); players connect to it directly with PeerJS.
 const $ = (s, el = document) => el.querySelector(s);
 const app = $('#app');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const store = {
+  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+  del(k) { try { sessionStorage.removeItem(k); } catch {} },
+};
 
-// One identity per browser tab (survives a reload)
-let token;
-try { token = sessionStorage.getItem('duelToken'); } catch {}
-if (!token) { token = crypto.randomUUID(); try { sessionStorage.setItem('duelToken', token); } catch {} }
+// One identity per browser tab (survives a reload, so a player can come back to their seat)
+let token = store.get('duelToken');
+if (!token) { token = crypto.randomUUID(); store.set('duelToken', token); }
 
-let screen = 'waiting';   // waiting | alert | role | create | join | room
-let state = null;         // room state from the server
-let offset = 0;           // server clock - local clock
-let feedback = null;      // { id, choice, correct, ok, until } — shown briefly after answering
+let screen = 'waiting';   // waiting | alert | role | create | join | connecting | room
+let state = null;         // room state (computed locally for the referee, received from the referee for players)
+let offset = 0;           // referee clock - local clock (players only)
+let feedback = null;      // shown briefly after answering
 let sending = false;
+let host = null;          // referee only: the game engine (host.js)
+let link = null;          // player only: { peer, conn, code, joined }
 
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.className = 'toast show';
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = 'toast', 2500);
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = 'toast', 2800);
 }
-async function post(url, body) {
-  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, ...body }) });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || 'Error');
-  return j;
-}
-const act = (action, extra = {}) => post('/api/action', { code: state.code, action, ...extra })
-  .then(j => { if (j.state) onRoomState(j.state); })
-  .catch(e => toast(e.message));
 const now = () => Date.now() + offset;
+const peerReady = () => {
+  if (typeof Peer === 'undefined') { toast('Could not load the connection library — check your internet connection'); return false; }
+  return true;
+};
 
 // ---------- sound (browsers only allow it after a first click on the page) ----------
 let audio;
@@ -51,47 +53,35 @@ const sfx = {
   end: () => { tone(523, .2, 'triangle', .2); tone(659, .2, 'triangle', .2, .2); tone(784, .5, 'triangle', .2, .4); },
 };
 
-// ---------- polling (works on serverless hosting like Vercel) ----------
-// Outside a room: ask every 4 s when the next global "DUEL!" alert is due, then fire it at that exact time.
-// Inside a room: fetch the room state every 0.7 s during a duel, 1.5 s otherwise.
-let alertNext = 0, lastFired = 0, dbError = '';
-let pollCode = null, pollTimer = null, lastPing = 0;
-
-async function getJson(url) {
-  const t0 = Date.now();
-  const r = await fetch(url, { cache: 'no-store' });
-  const j = await r.json().catch(() => ({}));
-  if (j.serverNow) offset = j.serverNow - (t0 + Date.now()) / 2;   // keep clocks in sync
-  return { r, j };
+// ---------- the random "DUEL!" alert, without a server ----------
+// Every page computes the same pseudo-random alert times from the date, so all screens go off together
+// (phones and computers keep their clocks in sync over the internet).
+// For testing: add ?alert=0.2-0.5 to the URL (minutes) on every screen.
+const [ALERT_MIN, ALERT_MAX] = (() => {
+  const m = /^(\d*\.?\d+)-(\d*\.?\d+)$/.exec(new URLSearchParams(location.search).get('alert') || '');
+  return m ? [Number(m[1]), Math.max(Number(m[1]), Number(m[2]))] : [1, 10];
+})();
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
 }
-
-async function pollOnce() {
-  const code = pollCode;
-  try {
-    if (code) {
-      const ping = Date.now() - lastPing > 3000;
-      const { r, j } = await getJson(`/api/state?code=${encodeURIComponent(code)}&token=${encodeURIComponent(token)}${ping ? '&ping=1' : ''}`);
-      if (code !== pollCode) return;               // left the room meanwhile
-      if (r.ok) { if (ping) lastPing = Date.now(); onRoomState(j); }
-      else if ([403, 404, 410].includes(r.status)) roomGone(j.error || 'The room was closed');
-    } else {
-      const { r, j } = await getJson('/api/alert');
-      const err = r.ok ? '' : (j.error || 'Server unavailable');
-      if (r.ok) alertNext = j.next;
-      if (err !== dbError) { dbError = err; if (screen === 'waiting') render(); }
+function nextAlertAfter(time) {
+  const DAY = 86400000;
+  for (let day = Math.floor(time / DAY); ; day++) {
+    const rng = mulberry32(day ^ 0x5eed1e5 ^ Math.round(ALERT_MIN * 1000) ^ (Math.round(ALERT_MAX * 1000) << 12));
+    for (let t = day * DAY; t < (day + 1) * DAY;) {
+      t += (ALERT_MIN + rng() * (ALERT_MAX - ALERT_MIN)) * 60000;
+      if (t > time) return t;
     }
-  } catch { /* network hiccup: try again next time */ }
+  }
 }
-function schedulePoll() {
-  clearTimeout(pollTimer);
-  const delay = pollCode ? (state?.status === 'running' ? 700 : 1500) : 4000;
-  pollTimer = setTimeout(() => pollOnce().then(schedulePoll), delay);
-}
-function startPolling(code) {
-  pollCode = code; lastPing = 0;
-  clearTimeout(pollTimer);
-  pollOnce().then(schedulePoll);
-}
+let alertNext = nextAlertAfter(Date.now());
+setInterval(() => {
+  const t = Date.now();
+  if (t < alertNext) return;
+  const due = alertNext;
+  alertNext = nextAlertAfter(t);
+  if (screen === 'waiting' && t < due + 10000) showAlert();
+}, 200);
 
 function showAlert() {
   go('alert'); sfx.siren();
@@ -102,12 +92,8 @@ function showAlert() {
   }, 700);
 }
 
-// ---------- room connection ----------
-function enterRoom(code) {
-  history.replaceState(null, '', `?room=${code}`);
-  startPolling(code);
-}
-const sameState = (a, b) => a && b && JSON.stringify({ ...a, serverNow: 0 }) === JSON.stringify({ ...b, serverNow: 0 });
+// ---------- room state ----------
+const sameState = (a, b) => a && b && JSON.stringify({ ...a, hostNow: 0 }) === JSON.stringify({ ...b, hostNow: 0 });
 function onRoomState(s) {
   const prev = state;
   state = s;
@@ -115,27 +101,140 @@ function onRoomState(s) {
   if (screen === 'room' && sameState(prev, s)) return;   // nothing new: don't rebuild the page
   screen = 'room'; render();
 }
-// Leaving on purpose: tell the server (referee → closes the room for everyone, player → frees the seat)
+
+// ---------- referee ----------
+async function createRoom(seconds, categories) {
+  if (!peerReady()) return;
+  go('connecting');
+  host = new Host(onRoomState);
+  try {
+    const code = await host.create(seconds, categories);
+    history.replaceState(null, '', `?room=${code}`);
+  } catch (e) {
+    host = null; toast(e.message); go('create');
+  }
+}
+function act(name, extra) {
+  try { host.action(name, extra); } catch (e) { toast(e.message); }
+}
+
+// ---------- player ----------
+function dropLink(l = link) {
+  if (!l) return;
+  l.dead = true;
+  try { l.peer.destroy(); } catch {}
+  if (link === l) link = null;
+}
+
+function joinRoom(code, { name, rejoin = false } = {}) {
+  return new Promise((resolve, reject) => {
+    dropLink();
+    const peer = new Peer();
+    const l = link = { peer, conn: null, code, joined: false };
+    const fail = (msg) => {
+      if (l.joined || l.dead) return;
+      clearTimeout(timer); dropLink(l); reject(new Error(msg));
+    };
+    const timer = setTimeout(() => fail("Could not reach the room — check the code, or the referee's connection"), 12000);
+    peer.on('error', (e) => fail(netError(e)));
+    peer.on('open', () => {
+      const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
+      l.conn = conn;
+      conn.on('open', () => conn.send({ t: 'hello', token, name, rejoin }));
+      conn.on('data', (msg) => {
+        if (link !== l || !msg) return;
+        if (msg.t === 'joined') {
+          l.joined = true; clearTimeout(timer);
+          store.set('duelPlayerRoom', code);
+          history.replaceState(null, '', `?room=${code}`);
+          resolve(msg.slot);
+        } else if (msg.t === 'error') fail(msg.error);
+        else onHostMessage(msg);
+      });
+      conn.on('close', () => { if (link === l && l.joined) onHostLost(); });
+    });
+  });
+}
+
+let pendingAnswer = null;
+function onHostMessage(msg) {
+  if (msg.t === 'state') {
+    offset = msg.state.hostNow - Date.now();
+    onRoomState(msg.state);
+  } else if (msg.t === 'result') {
+    if (pendingAnswer && pendingAnswer.id === msg.id) { pendingAnswer.resolve(msg); pendingAnswer = null; }
+  } else if (msg.t === 'closed') {
+    roomGone('The referee closed the room');
+  } else if (msg.t === 'kicked') {
+    roomGone('The referee removed you from the room');
+  }
+}
+
+// The connection to the referee dropped (their page reloaded, network blip…): try to get back in
+async function onHostLost() {
+  const code = link && link.code;
+  dropLink();
+  if (!code) return;
+  if (state && state.status === 'over') return;   // keep the final score on screen
+  toast('Connection to the referee lost — reconnecting…');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await new Promise(r => setTimeout(r, 2500));
+    if (screen !== 'room' && screen !== 'connecting') return;   // the player left meanwhile
+    try { await joinRoom(code, { rejoin: true }); toast('Reconnected!'); return; } catch {}
+  }
+  toast('The room is no longer reachable');
+  backToWaiting();
+}
+
+async function answer(i) {
+  const q = state?.question;
+  if (!q || feedback || sending || phase() !== 'running' || !link?.conn?.open) return;
+  sending = true;
+  try {
+    const r = await new Promise((resolve) => {
+      pendingAnswer = { id: q.id, resolve };
+      link.conn.send({ t: 'answer', id: q.id, choice: i });
+      setTimeout(() => resolve({ error: 'The referee is not answering' }), 4000);
+    });
+    if (r.error) { if (r.error !== 'Not running') toast(r.error); return; }
+    feedback = { q, choice: i, correct: r.correct, ok: r.ok };
+    r.ok ? sfx.good() : sfx.bad();
+    offset = r.state.hostNow - Date.now();
+    state = r.state;   // contains the next question and the new score
+    render();
+    setTimeout(() => { feedback = null; render(); }, r.ok ? 450 : 900);
+  } finally { sending = false; pendingAnswer = null; }
+}
+
+// ---------- leaving ----------
+// Referee: closes the room for everyone. Player: frees their seat.
 function leaveRoom() {
-  if (state) post('/api/leave', { code: state.code }).catch(() => {});
+  if (host) { host.close(); host = null; }
+  else if (link) {
+    const l = link;
+    try { l.conn.send({ t: 'leave' }); } catch {}
+    l.dead = true; link = null;
+    setTimeout(() => { try { l.peer.destroy(); } catch {} }, 300);
+  }
   backToWaiting();
 }
 function backToWaiting() {
-  state = null; feedback = null;
-  history.replaceState(null, '', location.pathname);
-  startPolling(null);
+  state = null; feedback = null; offset = 0;
+  store.del('duelPlayerRoom');
+  history.replaceState(null, '', location.pathname + (new URLSearchParams(location.search).get('alert') ? `?alert=${new URLSearchParams(location.search).get('alert')}` : ''));
   go('waiting');
 }
 // The room disappeared (referee closed it, or we were kicked)
 function roomGone(msg) {
-  if (state && state.status === 'over' && state.role !== 'ref') {
-    // keep showing the final score; the player goes back with the button when ready
-    startPolling(null);
-    return;
-  }
+  dropLink();
+  if (state && state.status === 'over') return;   // keep showing the final score
   toast(msg);
   backToWaiting();
 }
+// Closing the referee's tab would end the room for everyone
+window.addEventListener('beforeunload', (e) => {
+  if (host && host.room) { e.preventDefault(); e.returnValue = ''; }
+});
 
 function go(s) { screen = s; render(); }
 
@@ -158,8 +257,7 @@ const screens = {
       <div class="dice">🎲</div>
       <h1>Game in progress…</h1>
       <p class="muted">A duel can break out at any moment. Keep playing!</p>
-      ${dbError ? `<p class="error">⚠️ ${esc(dbError)}</p>` : ''}
-      <button class="btn small ghost mt" id="duelNow" title="Trigger the alert on every screen in a few seconds">⚔️ Duel now</button>
+      <button class="btn small ghost mt" id="duelNow" title="Shows the duel alert on this screen only">⚔️ Duel now</button>
     </div>`,
 
   alert: () => `
@@ -183,7 +281,8 @@ const screens = {
       <label>Duel length (seconds)</label>
       <input type="number" id="dur" min="10" max="900" value="60">
       <label>Question categories</label>
-      <div class="cats" id="cats"><span class="muted">Loading…</span></div>
+      <div class="cats">${CATEGORIES.map(c => `<label><input type="checkbox" data-cat="${esc(c)}" checked> ${esc(c)}</label>`).join('')}</div>
+      <p class="muted small">Keep this page open during the duel: your device runs the game.</p>
       <div class="row mt">
         <button class="btn" id="backRole" style="flex:0 0 auto">← Back</button>
         <button class="btn ok big" id="create">Create the room</button>
@@ -203,6 +302,13 @@ const screens = {
       </div>
     </div>`,
 
+  connecting: () => `
+    <div class="panel center narrowpanel">
+      <div class="spinner"></div>
+      <p>Connecting…</p>
+      <button class="btn ghost" id="cancelConnect">Cancel</button>
+    </div>`,
+
   room: () => state.role === 'ref' ? refView() : playerView(),
 };
 
@@ -211,7 +317,7 @@ function refView() {
   const s = state, [A, B] = [s.players.A, s.players.B];
   const slot = (p, k) => `
     <div class="pslot ${p.joined ? 'in' : ''} ${k}">
-      ${p.joined ? `<b>${esc(p.name)}</b><span class="dot ${p.online ? '' : 'off'}"></span>` : '<span class="muted">Waiting for a player…</span>'}
+      ${p.joined ? `<b>${esc(p.name)}</b><span class="dot ${p.online ? '' : 'off'}" title="${p.online ? 'connected' : 'disconnected'}"></span>` : '<span class="muted">Waiting for a player…</span>'}
       ${p.joined && s.status === 'lobby' ? `<button class="btn small ghost" data-kick="${k}">Kick</button>` : ''}
     </div>`;
   if (s.status === 'lobby') {
@@ -224,6 +330,7 @@ function refView() {
         <p class="muted">${s.duration / 1000} s · ${s.categories.length === s.allCategories.length ? 'all categories' : s.categories.map(esc).join(', ')}</p>
         <button class="btn ok big" id="start" ${ready ? '' : 'disabled'}>⚔️ Start the duel</button>
         ${ready ? '' : '<p class="muted">The duel can start once both players have joined.</p>'}
+        <p class="muted small">Keep this page open: your device runs the game.</p>
       </div>
       <p class="center"><button class="btn ghost" id="leave">Close the room</button></p>`;
   }
@@ -301,21 +408,6 @@ function playerView() {
     <div class="choices">${choices}</div>` : ''}`;
 }
 
-async function answer(i) {
-  const q = state?.question;
-  if (!q || feedback || sending || phase() !== 'running') return;
-  sending = true;
-  try {
-    const r = await post('/api/answer', { code: state.code, id: q.id, choice: i });
-    feedback = { q, choice: i, correct: r.correct, ok: r.ok };
-    r.ok ? sfx.good() : sfx.bad();
-    state = r.state;   // contains the next question and the new score
-    render();
-    setTimeout(() => { feedback = null; render(); }, r.ok ? 450 : 900);
-  } catch (e) { if (e.message !== 'Not running') toast(e.message); }
-  finally { sending = false; }
-}
-
 // ---------- render + events ----------
 function render() {
   document.body.dataset.screen = screen;
@@ -326,36 +418,34 @@ function render() {
   tickTimer();
 
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
-  on('duelNow', () => post('/api/duel-now', {})
-    .then(j => { alertNext = j.next; toast('⚔️ Duel in a few seconds on every screen…'); })
-    .catch(e => toast(e.message)));
+  on('duelNow', showAlert);
   on('accept', () => go('role'));
   on('backWait', () => go('waiting'));
   on('asRef', () => go('create'));
   on('asPlayer', () => { go('join'); $('#code').focus(); });
   on('backRole', () => go('role'));
+  on('cancelConnect', () => { if (host) { host.close(); host = null; } dropLink(); backToWaiting(); });
 
   if (screen === 'create') {
-    renderCategories();
-    on('create', async () => {
+    on('create', () => {
       const seconds = Math.round(Number($('#dur').value));
       if (!(seconds >= 10 && seconds <= 900)) return toast('Duration: 10 to 900 seconds');
       const categories = [...app.querySelectorAll('[data-cat]:checked')].map(c => c.dataset.cat);
       if (!categories.length) return toast('Pick at least one category');
-      try {
-        const { code } = await post('/api/create', { seconds, categories });
-        enterRoom(code);
-      } catch (e) { toast(e.message); }
+      createRoom(seconds, categories);
     });
   }
   if (screen === 'join') {
     try { $('#name').value = localStorage.getItem('duelName') || ''; } catch {}
     const join = async () => {
       const code = $('#code').value.trim().toUpperCase(), name = $('#name').value.trim();
-      if (code.length !== 4) return toast('The room code has 4 letters');
+      if (!/^[A-Z]{4}$/.test(code)) return toast('The room code has 4 letters');
       if (!name) return toast('Enter your name');
+      if (!peerReady()) return;
       try { localStorage.setItem('duelName', name); } catch {}
-      try { const r = await post('/api/join', { code, name }); enterRoom(r.code); } catch (e) { toast(e.message); }
+      go('connecting');
+      try { await joinRoom(code, { name }); }
+      catch (e) { toast(e.message); go('join'); $('#code').value = code; }
     };
     on('join', join);
     $('#code').onkeydown = e => { if (e.key === 'Enter') $('#name').focus(); };
@@ -369,16 +459,6 @@ function render() {
     app.querySelectorAll('[data-kick]').forEach(b => b.onclick = () => act('kick', { slot: b.dataset.kick }));
     app.querySelectorAll('[data-choice]').forEach(b => b.onclick = () => answer(Number(b.dataset.choice)));
   }
-}
-
-// categories come from the question bank on the server
-let allCategories = null;
-async function renderCategories() {
-  if (!allCategories) {
-    try { allCategories = (await (await fetch('/api/categories')).json()).categories; } catch { allCategories = []; }
-  }
-  const box = $('#cats'); if (!box) return;
-  box.innerHTML = allCategories.map(c => `<label><input type="checkbox" data-cat="${esc(c)}" checked> ${esc(c)}</label>`).join('');
 }
 
 document.addEventListener('keydown', (e) => {
@@ -410,22 +490,25 @@ function tickTimer() {
     el.classList.toggle('crit', left < 10000);
     const sec = Math.ceil(left / 1000);
     if (left > 0 && left <= 5000 && sec !== lastSec) { lastSec = sec; sfx.tick(); }
-    if (left === 0 && !tickTimer.ended) { tickTimer.ended = true; setTimeout(() => pollOnce(), 150); }  // fetch the results right away
-    if (left > 0) tickTimer.ended = false;
   }
 }
 (function loop() { tickTimer(); requestAnimationFrame(loop); })();
 
-// fire the global alert at the exact time the server announced (setInterval keeps running in background tabs)
-setInterval(() => {
-  if (screen !== 'waiting' || !alertNext || alertNext === lastFired) return;
-  const t = now();
-  if (t >= alertNext && t < alertNext + 10000) { lastFired = alertNext; showAlert(); }
-}, 200);
-
 // ---------- boot ----------
-const roomParam = new URLSearchParams(location.search).get('room');
-if (roomParam) {
-  // reload while in a room → reconnect if we were part of it
-  post('/api/join', { code: roomParam, check: true }).then(r => enterRoom(r.code)).catch(() => backToWaiting());
-} else { startPolling(null); render(); }
+(async function boot() {
+  const roomParam = (new URLSearchParams(location.search).get('room') || '').toUpperCase();
+  let saved = null;
+  try { saved = JSON.parse(store.get(HOST_SAVE_KEY)); } catch {}
+  if (roomParam && saved && saved.code === roomParam && peerReady()) {
+    // the referee reloaded the page: reopen the same room
+    go('connecting');
+    host = new Host(onRoomState);
+    if (!(await host.restore())) { host = null; toast('The room could not be reopened'); backToWaiting(); }
+  } else if (roomParam && store.get('duelPlayerRoom') === roomParam && peerReady()) {
+    // a player reloaded the page: take their seat back
+    go('connecting');
+    try { await joinRoom(roomParam, { rejoin: true }); } catch (e) { toast(e.message); backToWaiting(); }
+  } else {
+    if (roomParam) backToWaiting(); else render();
+  }
+})();
