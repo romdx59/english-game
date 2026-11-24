@@ -2,7 +2,7 @@
   "name": "english-duel",
   "version": "1.0.0",
   "private": true,
-  "description": "English quiz duel for two players on one screen: random DUEL! alert, shared timer, multiple-choice questions. No server.",
+  "description": "English quiz chess-clock duel for two players on one screen: random DUEL! alert, one clock per player, multiple-choice questions. No server.",
   "scripts": {
     "start": "node scripts/dev-server.js"
   },

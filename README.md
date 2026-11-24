@@ -1,6 +1,6 @@
 # ⚔️ English Duel
 
-A quick English quiz duel between two players on **one screen**. It has no server, no database and no network connection: everything runs in the page, so it also works on 4G or offline once loaded.
+A quick English quiz duel between two players on **one screen**, played with a single mouse. It has no server, no database and no network connection: everything runs in the page, so it also works on 4G or offline once loaded.
 
 ## How it works
 
@@ -8,12 +8,13 @@ A quick English quiz duel between two players on **one screen**. It has no serve
 2. At a random moment (every 1–10 min) the screen flashes **"DUEL!"** with a siren. The person who was playing picks an opponent.
    - **Duel now** shows the alert right away.
    - If the device was asleep at that moment (locked screen, background tab), the alert shows as soon as it wakes up.
-3. The referee types both names, the duel length and the question categories, then starts the duel.
-4. After a 3-2-1 countdown, the shared timer starts. The screen is split in two: each player has their own multiple-choice questions (4 choices) and their own score.
-   - A correct answer is worth 1 point and a wrong one is worth 0. Either way, the next question comes right after.
-   - **On a computer**: player 1 (left) answers with keys **A Z E R**, player 2 (right) with **U I O P**. These are the physical key positions, so on a QWERTY keyboard player 1 uses Q W E R.
-   - **On a tablet or phone held upright**: players sit face to face. The top half is upside down for the player across the table, and each player taps their own half.
-5. When the timer ends, the screen shows both scores and the winner. Draws are possible. Then choose **Rematch** or **Back to the game**.
+3. The referee types both names, the time per player (60 s by default), who starts (random by default) and the question categories, then starts the duel.
+4. After a 3-2-1 countdown, it's a **chess-clock duel**. Each player has their own clock, and only the player whose turn it is answers (4 choices); their clock is running.
+   - **Correct answer**: +1. Their clock stops, and both clocks stay stopped for 1 s while the mouse changes hands. Then the opponent's clock starts with a new question.
+   - **Wrong answer**: the right answer is shown, then a new question comes. Their clock keeps running.
+   - **The first player to reach 0:00 loses.**
+   - Keys **1 2 3 4** also answer. **Space** pauses.
+5. At the end, the screen shows the winner, the time each player had left and their correct answers. Then choose **Rematch** or **Back to the game**. In a rematch with "Random" start, the loser starts.
 
 The last duels are listed on the waiting screen. They are saved in this browser only.
 
